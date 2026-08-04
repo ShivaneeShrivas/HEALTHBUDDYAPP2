@@ -1,0 +1,121 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: healthbuddy
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: healthbuddy/native/package-lock.json
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Verify Render URL
+        working-directory: healthbuddy/native
+        run: |
+          if grep -q "YOUR-APP-NAME" capacitor.config.json; then
+            echo "::error::Update capacitor.config.json with your Render URL."
+            exit 1
+          fi
+
+      - name: Bundle Web App
+        run: |
+          python3 native/bundle_www.py
+
+      - name: Install npm packages
+        working-directory: healthbuddy/native
+        run: npm install
+
+      - name: Backup plugin sources
+        working-directory: healthbuddy/native
+        run: mv android plugin-src
+
+      - name: Create Android project
+        working-directory: healthbuddy/native
+        run: npx cap add android
+
+      - name: Restore native plugins
+        working-directory: healthbuddy/native
+        run: |
+          mkdir -p android/app/src/main/java/app/healthbuddy
+          cp plugin-src/StepsPlugin.java android/app/src/main/java/app/healthbuddy/
+          cp plugin-src/UsagePlugin.java android/app/src/main/java/app/healthbuddy/
+          cp plugin-src/MainActivity.java android/app/src/main/java/app/healthbuddy/
+
+      - name: Patch AndroidManifest
+        working-directory: healthbuddy/native
+        run: |
+          python3 <<'EOF'
+          from pathlib import Path
+
+          p = Path("android/app/src/main/AndroidManifest.xml")
+          s = p.read_text()
+
+          if "xmlns:tools" not in s:
+              s = s.replace(
+                  "<manifest ",
+                  '<manifest xmlns:tools="http://schemas.android.com/tools" ',
+                  1
+              )
+
+          if "ACTIVITY_RECOGNITION" not in s:
+              s = s.replace(
+                  "</manifest>",
+                  '''
+              <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION"/>
+              <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
+                  tools:ignore="ProtectedPermissions"/>
+          </manifest>'''
+              )
+
+          p.write_text(s)
+          EOF
+
+      - name: Copy App Icons
+        working-directory: healthbuddy/native
+        run: |
+          rm -rf android/app/src/main/res/mipmap-anydpi-v26 || true
+          cp -r appicon/mipmap-* android/app/src/main/res/
+
+      - name: Apply Icons
+        run: |
+          python3 native/apply_icons.py
+
+      - name: Sync Capacitor
+        working-directory: healthbuddy/native
+        run: npx cap sync android
+
+      - name: Build APK
+        working-directory: healthbuddy/native/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HealthBuddy-APK
+          path: healthbuddy/native/android/app/build/outputs/apk/debug/app-debug.apk
